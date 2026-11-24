@@ -23,15 +23,19 @@ function upd_startup()
     [ "$DPDK_DISABLE" != "y" ] && echo "$*" >> $TMP_FILE
 }
 
-function add_sonic_ext_config()
+# Renders a "<stanza> { <feature> <on|off> ... }" block from a comma-separated
+# <feature>=<on|off> list that a platform sets in /etc/sonic/vpp/syncd_vpp_env.
+# $2 is the variable name, used only for the error message.
+function add_feature_config()
 {
+    local stanza="$1" varname="$2" config="$3"
     local entry
 
-    [ "x$SONIC_EXT_CONFIG" == "x" ] && return 0
+    [ "x$config" == "x" ] && return 0
 
-    echo "sonic-ext {" >> $TMP_FILE
+    echo "$stanza {" >> $TMP_FILE
     local IFS=","
-    for entry in $SONIC_EXT_CONFIG; do
+    for entry in $config; do
 	# Kept space-free ("host-xc=off") because the same value is also passed
 	# via docker -e, which unlike the shell does not strip quotes.
 	entry="${entry//[[:space:]]/}"
@@ -40,7 +44,7 @@ function add_sonic_ext_config()
 	# where a stray brace would close the stanza and open an arbitrary one
 	# such as unix { exec <file> }.
 	[[ "$entry" =~ ^[a-z][a-z0-9-]*=(on|off|enable|disable)$ ]] || \
-	    error "invalid SONIC_EXT_CONFIG entry '$entry', expected <feature>=on|off"
+	    error "invalid $varname entry '$entry', expected <feature>=on|off"
 	echo "    ${entry%%=*} ${entry##*=}" >> $TMP_FILE
     done
     echo "}" >> $TMP_FILE
@@ -71,6 +75,15 @@ cp $STARTUP_TMPL $TMP_FILE || error "Failed to copy template file"
 [ "$DPDK_DISABLE" == "y" ] && sed -i -e 's/plugin dpdk_plugin/#plugin dpdk_plugin/g' $TMP_FILE
 [ "$NO_LINUX_NL" == "y" ] && sed -i -e 's/plugin linux_nl_plugin/#plugin linux_nl_plugin/g' $TMP_FILE
 
+# Unset and empty both mean adaptive: start_sonic_vpp.sh always passes the
+# variable, empty when the user did not set it.
+VPP_DEFAULT_RX_MODE=${VPP_DEFAULT_RX_MODE:-adaptive}
+[[ "$VPP_DEFAULT_RX_MODE" =~ ^(polling|interrupt|adaptive)$ ]] || \
+    error "VPP_DEFAULT_RX_MODE must be polling, interrupt or adaptive, got '$VPP_DEFAULT_RX_MODE'"
+# Anchored on the keyword so the placeholder's mention in the comment above
+# the stanza is left alone
+sed -i -e "s/default-rx-mode VPP_DEFAULT_RX_MODE/default-rx-mode $VPP_DEFAULT_RX_MODE/" $TMP_FILE
+
 IDX=0
 upd_startup "dpdk {"
 for port in ${portlist[@]};
@@ -98,7 +111,8 @@ echo "    buffers-per-numa $TOTBUF" >> $TMP_FILE
 [ "$DPDK_DISABLE" != "y" ] && echo "    page-size default-hugepage" >> $TMP_FILE
 echo "}" >> $TMP_FILE
 
-add_sonic_ext_config
+add_feature_config "sonic-ext" SONIC_EXT_CONFIG "$SONIC_EXT_CONFIG"
+add_feature_config "ip-validate" IP_VALIDATE_CONFIG "$IP_VALIDATE_CONFIG"
 
 if [ "$DPDK_DISABLE" != "y" ]; then
     if [ $IDX -le 6 ]; then

@@ -39,7 +39,7 @@ sonic_ext_main_t sonic_ext_main;
  */
 VLIB_PLUGIN_REGISTER () = {
   .version = SONIC_EXT_PLUGIN_BUILD_VER,
-  .description = "SONiC VPP extensions: punt-via-member, host-xc",
+  .description = "SONiC VPP extensions: punt-via-member, host-xc, packet-trim",
   .default_disabled = 1,
 };
 
@@ -135,12 +135,13 @@ sonic_ext_redirect_to_ingress_tap (vlib_buffer_t *b, u32 orig_rx,
 				   u16 *pushed_tpid, u16 *pushed_vlan_id)
 {
   vnet_main_t *vnm = vnet_get_main ();
-  sonic_ext_buffer_opaque_t *seb = sonic_ext_buffer (b);
+  /* copp-ttl-punt calls this without a capture cookie too */
+  sonic_ext_buffer_opaque_t *seb = sonic_ext_buffer_captured (b);
   vnet_sw_interface_t *swo;
   const lcp_itf_pair_t *lip;
   index_t lipi;
   u32 phy_sw;
-  u32 saved_vlan_tag = seb->orig_vlan_tag;
+  u32 saved_vlan_tag = seb ? seb->orig_vlan_tag : 0;
   i32 adv;
 
   *host_tap = ~0;
@@ -165,7 +166,7 @@ sonic_ext_redirect_to_ingress_tap (vlib_buffer_t *b, u32 orig_rx,
   if (*host_tap == excluded_tap)
     return 0;
 
-  seb->magic = 0;
+  sonic_ext_buffer_consume (b);
 
   /* Restore the original wire L2 position.  ethernet-input may have
    * advanced past the Ethernet header before either redirect node runs. */
@@ -220,6 +221,198 @@ sonic_ext_ip2me_enable_disable (u32 sw_if_index, int enable)
   vnet_l2_feature_enable_disable ("l2-input-ip6", "sonic-ext-ip2me-ip6",
 				  sw_if_index, enable, 0, 0);
 }
+
+/*
+ * RIF loopback (hairpin) packet action. The SAIVPP layer calls this from its
+ * SAI_ROUTER_INTERFACE_ATTR_LOOPBACK_PACKET_ACTION handler. The per-interface
+ * action is stored in loopback_action_by_sw_if_index and the
+ * sonic-ext-ip4/ip6-loopback output-arc nodes are enabled only while the
+ * action is DROP, so a FORWARD (default) interface pays zero per-packet cost.
+ * Gated by the iface_loopback feature toggle, consistent with the other
+ * SAIVPP-owned sonic-ext features.
+ */
+int
+sonic_ext_iface_loopback_set_action (u32 sw_if_index, u8 action)
+{
+  sonic_ext_main_t *sem = &sonic_ext_main;
+  int enable = (action == SONIC_EXT_LOOPBACK_ACTION_DROP);
+  u8 prev;
+  int rv;
+
+  /* Reject anything that is not one of the two defined actions, so an
+   * out-of-range value can never be stored and then mis-read as FORWARD. */
+  if (action != SONIC_EXT_LOOPBACK_ACTION_FORWARD &&
+      action != SONIC_EXT_LOOPBACK_ACTION_DROP)
+    return VNET_API_ERROR_INVALID_VALUE;
+
+  /* Feature globally off (sonic-ext { iface-loopback off }): behave like the
+   * other SAIVPP-owned features and do not wire anything. */
+  if (!sem->iface_loopback)
+    {
+      if (enable)
+	clib_warning ("sonic-ext: iface-loopback off, ignoring DROP on "
+		      "sw_if_index %u",
+		      sw_if_index);
+      return 0;
+    }
+
+  /* loopback_action_by_sw_if_index is written only here, from the main/API
+   * thread. The ip4/ip6-loopback nodes read it on worker threads, but
+   * vnet_feature_enable_disable() below performs a worker barrier sync, so the
+   * vector growth/update is visible before the feature (and thus the node) is
+   * enabled on this interface. */
+  vec_validate_init_empty (sem->loopback_action_by_sw_if_index, sw_if_index,
+			   SONIC_EXT_LOOPBACK_ACTION_FORWARD);
+  prev = sem->loopback_action_by_sw_if_index[sw_if_index];
+
+  /* Idempotent: VPP feature enable/disable is ref-counted, so a repeated SET
+   * to the same action (e.g. a SAI attribute replay) would enable the
+   * output-arc feature more than once and a single later disable would leave
+   * the drop node installed. Only toggle the arcs on a real FORWARD<->DROP
+   * transition. */
+  if (prev == action)
+    return 0;
+
+  /* Set the action before enabling so the node sees DROP the moment the arc
+   * is live; on DROP->FORWARD the node keeps forwarding until it is disabled. */
+  sem->loopback_action_by_sw_if_index[sw_if_index] = action;
+
+  rv = vnet_feature_enable_disable ("ip4-output", "sonic-ext-ip4-loopback",
+				    sw_if_index, enable, 0, 0);
+  if (rv)
+    {
+      sem->loopback_action_by_sw_if_index[sw_if_index] = prev;
+      return rv;
+    }
+
+  rv = vnet_feature_enable_disable ("ip6-output", "sonic-ext-ip6-loopback",
+				    sw_if_index, enable, 0, 0);
+  if (rv)
+    {
+      /* Roll back the ip4 arc and the stored action to avoid a half-enabled
+       * state. */
+      vnet_feature_enable_disable ("ip4-output", "sonic-ext-ip4-loopback",
+				   sw_if_index, !enable, 0, 0);
+      sem->loopback_action_by_sw_if_index[sw_if_index] = prev;
+    }
+
+  return rv;
+}
+
+/*
+ * On interface delete, reset the loopback action so a recycled sw_if_index
+ * cannot inherit a stale DROP. The output-arc features themselves are torn
+ * down by VPP when the interface goes away.
+ */
+static clib_error_t *
+sonic_ext_iface_loopback_sw_if_add_del (vnet_main_t *vnm, u32 sw_if_index,
+					u32 is_add)
+{
+  sonic_ext_main_t *sem = &sonic_ext_main;
+  (void) vnm;
+
+  if (!is_add
+      && sw_if_index < vec_len (sem->loopback_action_by_sw_if_index))
+    sem->loopback_action_by_sw_if_index[sw_if_index] =
+      SONIC_EXT_LOOPBACK_ACTION_FORWARD;
+
+  return 0;
+}
+
+VNET_SW_INTERFACE_ADD_DEL_FUNCTION (sonic_ext_iface_loopback_sw_if_add_del);
+
+/*
+ * Tunnel encap TTL (SAI pipe TTL model). The SAIVPP layer calls this for an
+ * IPIP tunnel whose SAI tunnel has SAI_TUNNEL_ATTR_ENCAP_TTL_MODE = PIPE, with
+ * SAI_TUNNEL_ATTR_ENCAP_TTL_VAL. The TTL is stored in
+ * tunnel_encap_ttl_by_sw_if_index and the sonic-ext-ip4/ip6-tunnel-encap-ttl
+ * output-arc nodes are enabled while it is non-zero, so a tunnel without one
+ * pays no per-packet cost. TTL 0 removes it. Gated by the tunnel_encap_ttl
+ * feature toggle, consistent with the other SAIVPP-owned sonic-ext features.
+ */
+int
+sonic_ext_tunnel_encap_ttl_set (u32 sw_if_index, u8 ttl)
+{
+  sonic_ext_main_t *sem = &sonic_ext_main;
+  int enable = (ttl != 0);
+  u8 prev;
+  int rv;
+
+  if (!sem->tunnel_encap_ttl)
+    {
+      if (enable)
+	clib_warning ("sonic-ext: tunnel-encap-ttl off, ignoring TTL %u on "
+		      "sw_if_index %u",
+		      ttl, sw_if_index);
+      return 0;
+    }
+
+  if (!enable && sw_if_index >= vec_len (sem->tunnel_encap_ttl_by_sw_if_index))
+    return 0;
+
+  /* The binary API calls this under the worker barrier, so the nodes on
+   * worker threads never read the vector while it moves. */
+  vec_validate_init_empty (sem->tunnel_encap_ttl_by_sw_if_index, sw_if_index,
+			   0);
+  prev = sem->tunnel_encap_ttl_by_sw_if_index[sw_if_index];
+
+  /* VPP feature enable/disable is ref-counted: toggle the arcs only when the
+   * tunnel gets or loses its TTL, and otherwise just change the value. */
+  if ((prev != 0) == enable)
+    {
+      sem->tunnel_encap_ttl_by_sw_if_index[sw_if_index] = ttl;
+      return 0;
+    }
+
+  /* Set the TTL before enabling so the nodes stamp it the moment the arcs
+   * are live; on removal they pass packets through until disabled. */
+  sem->tunnel_encap_ttl_by_sw_if_index[sw_if_index] = ttl;
+
+  rv = vnet_feature_enable_disable ("ip4-output",
+				    "sonic-ext-ip4-tunnel-encap-ttl",
+				    sw_if_index, enable, 0, 0);
+  if (rv)
+    {
+      sem->tunnel_encap_ttl_by_sw_if_index[sw_if_index] = prev;
+      return rv;
+    }
+
+  rv = vnet_feature_enable_disable ("ip6-output",
+				    "sonic-ext-ip6-tunnel-encap-ttl",
+				    sw_if_index, enable, 0, 0);
+  if (rv)
+    {
+      /* Roll back the ip4 arc and the stored TTL to avoid a half-enabled
+       * state. */
+      vnet_feature_enable_disable ("ip4-output",
+				   "sonic-ext-ip4-tunnel-encap-ttl",
+				   sw_if_index, !enable, 0, 0);
+      sem->tunnel_encap_ttl_by_sw_if_index[sw_if_index] = prev;
+    }
+
+  return rv;
+}
+
+/*
+ * On interface delete, clear the encap TTL so a recycled sw_if_index cannot
+ * inherit it. VPP tears down the output-arc features with the interface.
+ */
+static clib_error_t *
+sonic_ext_tunnel_encap_ttl_sw_if_add_del (vnet_main_t *vnm, u32 sw_if_index,
+					  u32 is_add)
+{
+  sonic_ext_main_t *sem = &sonic_ext_main;
+  (void) vnm;
+
+  if (!is_add &&
+      sw_if_index < vec_len (sem->tunnel_encap_ttl_by_sw_if_index))
+    sem->tunnel_encap_ttl_by_sw_if_index[sw_if_index] = 0;
+
+  return 0;
+}
+
+VNET_SW_INTERFACE_ADD_DEL_FUNCTION (sonic_ext_tunnel_encap_ttl_sw_if_add_del);
+
 
 /*
  * Is `phy_sw_if_index` a BVI (bridge-virtual interface)?  Used by
@@ -396,6 +589,23 @@ sonic_ext_set_punt_via_member (u8 is_enable)
     }
 }
 
+/* NEIGHBOR_MISS owns the unresolved-neighbour redirect independently of the
+ * broader punt-via-member feature. Keep the public feature latch unchanged:
+ * when it is off, only packets carrying an active NEIGHBOR_MISS reason may
+ * pass glean-redirect's run-time gate. */
+void
+sonic_ext_neighbor_miss_enable_redirect (void)
+{
+  sonic_ext_main_t *sem = &sonic_ext_main;
+
+  sonic_ext_capture_enable_all ();
+  if (!sem->glean_redirect_enabled)
+    {
+      sonic_ext_glean_redirect_enable_disable (1);
+      sem->glean_redirect_enabled = 1;
+    }
+}
+
 void
 sonic_ext_set_host_xc (u8 is_enable)
 {
@@ -488,10 +698,9 @@ sonic_ext_set_nd_punt (u8 is_enable)
  *   - sonic-ext-aggr-tap-redirect on the host  -- only if phy is an
  *     aggregate (BVI today, bond tomorrow) and punt-via-member is on.
  *
- * DHCPv4 client broadcast is trapped at l2-input-classify by the
- * per-member classifier session installed in SwitchVppFdb.cpp; it
- * does not need any per-LCP-pair feature on the BVI.  See
- * l2_trap_fixup_node.c.
+ * DHCP client traffic is trapped or copied by the classifier sessions
+ * installed by sairedis; the resulting host-bound packet is policed by
+ * sonic-ext-copp-ifout on the selected LCP TAP.
  *
  * This is the only place we know both (a) the host tap sw_if_index
  * and (b) which phy it shadows.
@@ -510,7 +719,7 @@ sonic_ext_lcp_pair_add_cb (lcp_itf_pair_t *lip)
   if (sem->aggr_tap_redirect_enabled
       && sonic_ext_phy_is_aggregate (lip->lip_phy_sw_if_index))
     sonic_ext_aggr_tap_redirect_enable_disable (lip->lip_host_sw_if_index, 1);
-  if (!sonic_ext_phy_is_aggregate (lip->lip_phy_sw_if_index))
+  if (sem->copp && !sonic_ext_phy_is_aggregate (lip->lip_phy_sw_if_index))
     sonic_ext_copp_ifout_enable_disable (lip->lip_host_sw_if_index, 1);
 }
 
@@ -528,7 +737,7 @@ sonic_ext_lcp_pair_del_cb (lcp_itf_pair_t *lip)
   if (sem->aggr_tap_redirect_enabled
       && sonic_ext_phy_is_aggregate (lip->lip_phy_sw_if_index))
     sonic_ext_aggr_tap_redirect_enable_disable (lip->lip_host_sw_if_index, 0);
-  if (!sonic_ext_phy_is_aggregate (lip->lip_phy_sw_if_index))
+  if (sem->copp && !sonic_ext_phy_is_aggregate (lip->lip_phy_sw_if_index))
     sonic_ext_copp_ifout_enable_disable (lip->lip_host_sw_if_index, 0);
 }
 
@@ -561,8 +770,9 @@ unformat_sonic_ext_onoff (unformat_input_t *input, va_list *args)
  * sonic_ext_apply_config() does the wiring.  Assigning rather than acting is
  * also what lets a second stanza merge with the first, per keyword.
  *
- * ip2me, l2-trap-fixup and l2-vlan-filter are stored but never acted on here:
- * saivpp wires those, and asks for them over sonic_ext_feature_get().
+ * ip2me, l2-trap-fixup, l2-trap-learn and l2-vlan-filter are stored but never
+ * acted on here: saivpp wires those, and asks for them over
+ * sonic_ext_feature_get().
  */
 static clib_error_t *
 sonic_ext_config (vlib_main_t *vm, unformat_input_t *input)
@@ -783,6 +993,7 @@ sonic_ext_init (vlib_main_t *vm)
     .pair_del_fn = sonic_ext_lcp_pair_del_cb,
   };
   clib_memset (sem, 0, sizeof (*sem));
+  sem->copp_neighbor_miss_entry_index = ~0;
   lcp_itf_pair_register_vft (&sonic_ext_lcp_vft);
 
   /* Defaults only -- no arcs are touched here, so a "sonic-ext { }" stanza
@@ -794,9 +1005,27 @@ sonic_ext_init (vlib_main_t *vm)
 
   sonic_ext_register_acl_deferred_mirror ();
 
-  lcp_itf_pair_walk (sonic_ext_copp_ifout_walk_enable_cb, NULL);
-  vnet_feature_enable_disable ("ip4-punt", "sonic-ext-copp-ip2me", 0, 1, 0, 0);
-  vnet_feature_enable_disable ("ip6-punt", "sonic-ext-copp-ip2me-ip6", 0, 1, 0, 0);
+  /* Keep new CoPP RPCs in their own API namespace so adding one does not
+   * change the legacy sonic_ext API CRC used by an older sairedis image. */
+  {
+    clib_error_t *error = sonic_ext_copp_api_hookup (vm);
+    if (error)
+      return error;
+  }
+
+  /* Likewise for the tunnel RPCs (sets tunnel_msg_id_base). */
+  {
+    clib_error_t *error = sonic_ext_tunnel_api_hookup (vm);
+    if (error)
+      return error;
+  }
+
+  /* Register the packet-trim binary API (sets trim_msg_id_base). */
+  {
+    clib_error_t *error = sonic_ext_trim_api_hookup (vm);
+    if (error)
+      return error;
+  }
 
   return 0;
 }
@@ -817,8 +1046,8 @@ sonic_ext_apply_config (vlib_main_t *vm)
 
   if (sem->punt_via_member)
     sonic_ext_set_punt_via_member (1);
-  else if (sem->drop_member_stats)
-    /* Last remaining cookie consumer, so capture still has to run. */
+  else if (sem->drop_member_stats || sem->drop_reason_stats)
+    /* Remaining cookie consumers, so capture still has to run. */
     sonic_ext_capture_enable_all ();
 
   if (sem->host_xc)
@@ -827,6 +1056,16 @@ sonic_ext_apply_config (vlib_main_t *vm)
   /* After ip6_nd_init / ip6_ra_init have registered VPP's own ND handlers. */
   if (sem->nd_punt)
     sonic_ext_set_nd_punt (1);
+
+  if (sem->copp)
+    {
+      lcp_itf_pair_walk (sonic_ext_copp_ifout_walk_enable_cb, NULL);
+      vnet_feature_enable_disable ("ip4-punt", "sonic-ext-copp-ip2me", 0, 1,
+                                   0, 0);
+      vnet_feature_enable_disable ("ip6-punt", "sonic-ext-copp-ip2me-ip6", 0,
+                                   1, 0, 0);
+      sonic_ext_copp_udld_enable (vm);
+    }
 
   /* Nothing to wire for these -- saivpp does it, once it has asked.  Logged
    * so an old saivpp that never asks does not make the setting look applied. */
@@ -839,4 +1078,6 @@ sonic_ext_apply_config (vlib_main_t *vm)
   return 0;
 }
 
-VLIB_MAIN_LOOP_ENTER_FUNCTION (sonic_ext_apply_config);
+VLIB_MAIN_LOOP_ENTER_FUNCTION (sonic_ext_apply_config) = {
+  .runs_before = VLIB_INITS ("start_workers"),
+};

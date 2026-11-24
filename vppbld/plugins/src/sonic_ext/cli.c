@@ -13,6 +13,7 @@
  * limitations under the License.
  */
 #include <sonic_ext/sonic_ext.h>
+#include <sonic_ext/pbh.h>
 
 #include <vlib/vlib.h>
 #include <vppinfra/format.h>
@@ -282,28 +283,90 @@ VLIB_CLI_COMMAND (sonic_ext_copp_ifout_bind_command, static) = {
 };
 
 static clib_error_t *
+sonic_ext_copp_neighbor_miss_bind_command_fn (vlib_main_t *vm,
+					      unformat_input_t *input,
+					      vlib_cli_command_t *cmd)
+{
+  u8 *policer_name = 0;
+  int is_bind = 1;
+  clib_error_t *error = 0;
+
+  while (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
+    {
+      if (unformat (input, "policer %s", &policer_name))
+	;
+      else if (unformat (input, "del"))
+	is_bind = 0;
+      else
+	{
+	  error = clib_error_return (0, "unknown input `%U'",
+				    format_unformat_error, input);
+	  goto done;
+	}
+    }
+
+  if (is_bind && !policer_name)
+    {
+      error = clib_error_return (
+	0, "usage: sonic-ext copp-neighbor-miss bind policer <name> [del]");
+      goto done;
+    }
+
+  {
+    int rv = sonic_ext_copp_neighbor_miss_bind (
+      policer_name ? (char *) policer_name : "", is_bind);
+    if (rv)
+      error = clib_error_return (0, "bind failed: rv %d", rv);
+  }
+
+done:
+  vec_free (policer_name);
+  return error;
+}
+
+VLIB_CLI_COMMAND (sonic_ext_copp_neighbor_miss_bind_command, static) = {
+  .path = "sonic-ext copp-neighbor-miss bind",
+  .short_help = "sonic-ext copp-neighbor-miss bind policer <name> [del]",
+  .function = sonic_ext_copp_neighbor_miss_bind_command_fn,
+};
+
+static clib_error_t *
 show_sonic_ext_copp_ifout_command_fn (vlib_main_t *vm,
 				      unformat_input_t *input,
 				      vlib_cli_command_t *cmd)
 {
   sonic_ext_main_t *sem = &sonic_ext_main;
 
-  vlib_cli_output (vm, "%-8s %-40s %-12s %10s %10s %10s %s",
-		   "ethtype", "policer-name", "vpp-idx",
-		   "conform", "exceed", "violate", "match");
+  vlib_cli_output (vm, "%-14s %-40s %-12s %10s %10s %10s %s",
+		   "key", "policer-name", "vpp-idx", "conform", "exceed",
+		   "violate", "match");
   for (u32 i = 0; i < sem->copp_ifout_n_entries; i++)
     {
       if (!sem->copp_ifout_entries[i].in_use)
 	continue;
-      vlib_cli_output (vm, "0x%04x   %-40s %-12d %10llu %10llu %10llu %s",
-		       sem->copp_ifout_entries[i].ethertype,
-		       sem->copp_ifout_entries[i].name,
-		       (i32) sem->copp_ifout_entries[i].policer_index,
-		       sem->copp_ifout_conform_packets[i],
-		       sem->copp_ifout_exceed_packets[i],
-		       sem->copp_ifout_violate_packets[i],
-		       sem->copp_ifout_entries[i].match_ip4_ttl_expiring ?
-			 "ip4-ttl<=1" : "-");
+      if (sem->copp_ifout_entries[i].match_neighbor_miss)
+	vlib_cli_output (vm, "%-14s %-40s %-12d %10llu %10llu %10llu %s",
+			 "neighbor-miss", sem->copp_ifout_entries[i].name,
+			 (i32) sem->copp_ifout_entries[i].policer_index,
+			 sem->copp_ifout_conform_packets[i],
+			 sem->copp_ifout_exceed_packets[i],
+			 sem->copp_ifout_violate_packets[i], "neighbor-miss");
+      else
+	vlib_cli_output (vm,
+			 "0x%04x         %-40s %-12d %10llu %10llu %10llu %s",
+			 sem->copp_ifout_entries[i].ethertype,
+			 sem->copp_ifout_entries[i].name,
+			 (i32) sem->copp_ifout_entries[i].policer_index,
+			 sem->copp_ifout_conform_packets[i],
+			 sem->copp_ifout_exceed_packets[i],
+			 sem->copp_ifout_violate_packets[i],
+			 sem->copp_ifout_entries[i].match_ip4_ttl_expiring ?
+			   "ip4-ttl<=1" :
+			 sem->copp_ifout_entries[i].match_dhcp4 ?
+			   "dhcp4-udp/67,68" :
+			 sem->copp_ifout_entries[i].match_dhcp6 ?
+			   "dhcp6-udp/546,547" :
+			   "-");
     }
 
   return 0;
@@ -373,7 +436,7 @@ show_sonic_ext_command_fn (vlib_main_t *vm, unformat_input_t *input,
     vlib_cli_output (vm, "  %-17s : %s", name, sem->field ? "on" : "off");
   foreach_sonic_ext_feature
 #undef _
-  /* Derived from the two cookie consumers above, so report the latch. */
+  /* Derived from the cookie consumers above, so report the latch. */
   vlib_cli_output (vm, "  capture (derived) : %s",
 		   sem->capture_enabled ? "on" : "off");
   /* Stored for saivpp, which wires these; arc membership does not reflect them. */
@@ -389,6 +452,7 @@ show_sonic_ext_command_fn (vlib_main_t *vm, unformat_input_t *input,
   vlib_cli_output (vm, "  glean redirect    : %llu", sem->glean_redirects);
   vlib_cli_output (vm, "  host-xc direct    : %llu", sem->host_xc_direct);
   vlib_cli_output (vm, "  l2 trap fixups    : %llu", sem->l2_trap_fixups);
+  vlib_cli_output (vm, "  l2 trap learns    : %llu", sem->l2_trap_learns);
   vlib_cli_output (vm, "  ip2me hits        : %llu", sem->ip2me_hits);
   vlib_cli_output (vm, "  ttl-punt enabled  : %s",
 		   sem->copp_ttl_punt_enabled ? "on" : "off");
@@ -429,4 +493,104 @@ VLIB_CLI_COMMAND (show_sonic_ext_mirror_encap_command, static) = {
   .path = "show sonic-ext mirror-encap",
   .short_help = "show sonic-ext mirror-encap",
   .function = show_sonic_ext_mirror_encap_command_fn,
+};
+
+static clib_error_t *
+show_sonic_ext_pbh_command_fn (vlib_main_t *vm, unformat_input_t *input,
+			       vlib_cli_command_t *cmd)
+{
+  sonic_ext_pbh_main_t *pm = &sonic_ext_pbh_main;
+  sonic_ext_pbh_profile_t *p;
+  sonic_ext_pbh_table_t *t;
+  vnet_main_t *vnm = vnet_get_main ();
+  int show_all = 1, profiles = 0, tables = 0, interfaces = 0;
+  u32 i;
+
+  while (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
+    {
+      if (unformat (input, "profiles"))
+	profiles = 1, show_all = 0;
+      else if (unformat (input, "tables"))
+	tables = 1, show_all = 0;
+      else if (unformat (input, "interfaces"))
+	interfaces = 1, show_all = 0;
+      else
+	return clib_error_return (0, "unknown input `%U'",
+				  format_unformat_error, input);
+    }
+
+  if (!sonic_ext_main.pbh)
+    {
+      vlib_cli_output (vm, "pbh is disabled in startup.conf");
+      return 0;
+    }
+
+  if (show_all || profiles)
+    {
+      vlib_cli_output (vm, "hash profiles:");
+      pool_foreach (p, pm->profiles)
+	vlib_cli_output (vm, "  [%u] %U", p - pm->profiles,
+			 format_sonic_ext_pbh_profile, p);
+    }
+
+  if (show_all || tables)
+    {
+      vlib_cli_output (vm, "tables:");
+      pool_foreach (t, pm->tables)
+	{
+	  u32 ti = t - pm->tables;
+	  sonic_ext_pbh_rule_t *r;
+
+	  vlib_cli_output (vm, "  [%u] %v  (%u rule%s, %u interface%s)", ti,
+			   t->name, vec_len (t->rules),
+			   vec_len (t->rules) == 1 ? "" : "s",
+			   vec_len (t->sw_if_indices),
+			   vec_len (t->sw_if_indices) == 1 ? "" : "s");
+
+	  vec_foreach (r, t->rules)
+	    {
+	      vlib_counter_t c;
+
+	      vlib_get_combined_counter (&t->counters, r - t->rules, &c);
+	      vlib_cli_output (vm, "    %U\n      matches %llu, %llu bytes",
+			       format_sonic_ext_pbh_rule, r, c.packets,
+			       c.bytes);
+	    }
+	}
+    }
+
+  if (show_all || interfaces)
+    {
+      vlib_cli_output (vm, "interfaces:");
+      for (i = 0; i < vec_len (pm->table_index_by_sw_if_index); i++)
+	{
+	  u32 refs = i < vec_len (pm->bvi_refcount_by_sw_if_index)
+		       ? pm->bvi_refcount_by_sw_if_index[i]
+		       : 0;
+
+	  if (pm->table_index_by_sw_if_index[i] == ~0)
+	    continue;
+
+	  if (refs)
+	    vlib_cli_output (
+	      vm, "  %U: table %u (bridge domain shadow, %u member%s)",
+	      format_vnet_sw_if_index_name, vnm, i,
+	      pm->table_index_by_sw_if_index[i], refs, refs == 1 ? "" : "s");
+	  else
+	    vlib_cli_output (vm, "  %U: table %u",
+			     format_vnet_sw_if_index_name, vnm, i,
+			     pm->table_index_by_sw_if_index[i]);
+	}
+    }
+
+  if (show_all)
+    vlib_cli_output (vm, "hits %llu, misses %llu", pm->hits, pm->misses);
+
+  return 0;
+}
+
+VLIB_CLI_COMMAND (show_sonic_ext_pbh_command, static) = {
+  .path = "show sonic-ext pbh",
+  .short_help = "show sonic-ext pbh [profiles|tables|interfaces]",
+  .function = show_sonic_ext_pbh_command_fn,
 };

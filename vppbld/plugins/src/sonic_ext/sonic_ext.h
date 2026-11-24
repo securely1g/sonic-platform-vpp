@@ -18,12 +18,68 @@
 #include <vnet/vnet.h>
 #include <vnet/buffer.h>
 #include <vnet/ethernet/ethernet.h>
+#include <vnet/ip/ip4_packet.h>
+#include <vnet/ip/ip6_packet.h>
 #include <vnet/feature/feature.h>
 #include <vnet/l2/l2_input.h>
 #include <vnet/l2/l2_bvi.h>
 #include <plugins/linux-cp/lcp_interface.h>
 
 #define SONIC_EXT_PLUGIN_BUILD_VER "1.0"
+
+/* Locate a transport header from an IPv6 base header without depending on
+ * b->current_data. Punt/reinject paths can restore the wire L2 header while
+ * retaining a later current_data position, which makes ip6_locate_header()
+ * reject an otherwise valid chain. The explicit byte span is authoritative. */
+static_always_inline int
+sonic_ext_ip6_locate_transport (const ip6_header_t *ip6, u32 available,
+				u8 wanted, u32 *offset)
+{
+  u8 next;
+  u32 off;
+
+  if (available < sizeof (*ip6))
+    return 0;
+
+  next = ip6->protocol;
+  off = sizeof (*ip6);
+  for (u32 depth = 0; depth < IP6_EXT_HDR_MAX; depth++)
+    {
+      const u8 *hdr;
+      u32 len;
+
+      if (next == wanted)
+	{
+	  *offset = off;
+	  return 1;
+	}
+
+      if (off + sizeof (ip6_ext_header_t) > available)
+	return 0;
+      hdr = (const u8 *) ip6 + off;
+
+      if (ip6_ext_hdr (next))
+	len = (((const ip6_ext_header_t *) hdr)->n_data_u64s + 1) << 3;
+      else if (next == IP_PROTOCOL_IPV6_FRAGMENTATION)
+	{
+	  const ip6_frag_hdr_t *frag = (const ip6_frag_hdr_t *) hdr;
+	  if (off + sizeof (*frag) > available || ip6_frag_hdr_offset (frag) != 0)
+	    return 0;
+	  len = sizeof (*frag);
+	}
+      else if (next == IP_PROTOCOL_IPSEC_AH)
+	len = (((const ip6_ext_header_t *) hdr)->n_data_u64s + 2) << 2;
+      else
+	return 0;
+
+      if (len < sizeof (ip6_ext_header_t) || off + len > available)
+	return 0;
+      next = hdr[0];
+      off += len;
+    }
+
+  return 0;
+}
 
 /*
  * Per-buffer metadata stash, overlaid on vnet_buffer2(b)->unused[].
@@ -43,9 +99,12 @@
  *   2. No memory allocation, no per-thread or atomic ops in the hot
  *      path -- the slot is buffer-local.
  *
- *   3. Self-cleaning -- when the buffer is freed and recycled, opaque2
- *      is reset by vlib_buffer_pool_init, so a stale value cannot be
- *      mis-attributed to an unrelated future packet.
+ *   3. Not self-cleaning -- freeing a buffer resets only its first
+ *      cache line from the pool template, so opaque2, magic included,
+ *      survives into whatever packet the buffer carries next.  Capture
+ *      therefore also sets SONIC_EXT_BUFFER_F_CAPTURED in b->flags,
+ *      which that reset does clear: orig_rx_sw_if_index belongs to
+ *      this packet only if the flag is set.
  *
  *   4. No conflict with stock VPP plugins.  We use only the trailing
  *      `unused[]` array of vnet_buffer_opaque2_t, never the union with
@@ -58,12 +117,22 @@
 
 /* --- Deferred egress mirror (Everflow MIRROR_EGRESS) extension ----------- *
  * mirror_sw_if_index carries the ERSPAN/GRE tunnel the deferred clone is
- * sent to; the ACL dataplane node stamps it into the cookie alongside the
- * magic when a matched rule has ACL_MIRROR_F_DEFERRED set. */
+ * sent to; the ACL dataplane node stamps it into the cookie, flagged by
+ * SONIC_EXT_BUFFER_F_MIRROR_PENDING rather than the magic, when a matched
+ * rule has ACL_MIRROR_F_DEFERRED set. */
 #define SONIC_EXT_INVALID_SW_IF_INDEX ~0U
 #define SONIC_EXT_INVALID_VLAN_TAG ~0U
 /* Buffer flag: a deferred egress-mirror clone is pending on this packet. */
 #define SONIC_EXT_BUFFER_F_MIRROR_PENDING VNET_BUFFER_F_AVAIL1
+
+/*
+ * AVAIL2 is SONIC_EXT_BUFFER_F_VNET_BUF, defined in sonic_ext_vnet_buf.h
+ * beside the facility it guards.  Noted here so the plugin's claims on the
+ * nine shared AVAIL bits stay visible in one place.
+ */
+/* Buffer flag: sonic-ext-capture stamped orig_rx_sw_if_index for this
+ * packet (see "Not self-cleaning" above). */
+#define SONIC_EXT_BUFFER_F_CAPTURED VNET_BUFFER_F_AVAIL3
 
 /*
  * orig_vlan_tag: outermost 802.1Q (or 802.1ad) tag observed on the
@@ -107,6 +176,92 @@ sonic_ext_buffer (vlib_buffer_t *b)
   return (sonic_ext_buffer_opaque_t *) vnet_buffer2 (b)->unused;
 }
 
+/* The capture cookie (magic, orig_rx_sw_if_index, orig_vlan_tag) if
+ * sonic-ext-capture stamped it for this very packet, else NULL.  Readers of
+ * those fields must come through here rather than test the magic: opaque2
+ * survives buffer recycling, SONIC_EXT_BUFFER_F_CAPTURED does not. */
+static_always_inline sonic_ext_buffer_opaque_t *
+sonic_ext_buffer_captured (vlib_buffer_t *b)
+{
+  sonic_ext_buffer_opaque_t *seb = sonic_ext_buffer (b);
+
+  if (!(b->flags & SONIC_EXT_BUFFER_F_CAPTURED) ||
+      seb->magic != SONIC_EXT_BUFFER_MAGIC)
+    return 0;
+  return seb;
+}
+
+/* Consume the capture cookie so no later node acts on it again. */
+static_always_inline void
+sonic_ext_buffer_consume (vlib_buffer_t *b)
+{
+  sonic_ext_buffer (b)->magic = 0;
+  b->flags &= ~SONIC_EXT_BUFFER_F_CAPTURED;
+}
+
+/*
+ * ------------------------------------------------------------------
+ * Packet trimming (SAI DROP_AND_TRIM) -- software egress admission +
+ * trim action.  See trim_admission_node.c and trim_api.c.
+ *
+ * VPP has no native egress QoS / per-queue admission substrate, so the
+ * SONiC scheduler's PIR is a dataplane no-op today.  The trim feature
+ * therefore carries its own software per-(port,queue) token-bucket
+ * admission shim, sized from the SONiC scheduler rate and buffer
+ * profile capacity programmed over the binary API.  A blocking
+ * scheduler (PIR=1) drains the bucket and produces a real, recoverable
+ * admission failure that the trim action node hangs off of.
+ * ------------------------------------------------------------------
+ */
+
+/* SONiC standard egress unicast queue count per port (0..7). */
+#define SONIC_EXT_TRIM_MAX_QUEUES 8
+
+/* Sentinel returned by sonic_ext_trim_packet_queue() for frames that have
+ * no resolvable egress queue (non-IP: ARP, LACP, LLDP, ...).  Such frames
+ * must never be policed or trimmed -- indexing port->q[] with this value
+ * is invalid, so callers must treat it as an unconditional bypass. */
+#define SONIC_EXT_TRIM_QUEUE_NONE 0xff
+
+/* PACKET_TRIM_DSCP_RESOLUTION_MODE. */
+typedef enum
+{
+  SONIC_EXT_TRIM_DSCP_MODE_SYMMETRIC = 0, /* use configured dscp_value */
+  SONIC_EXT_TRIM_DSCP_MODE_FROM_TC = 1,   /* asymmetric egress-map lookup */
+} sonic_ext_trim_dscp_mode_t;
+
+/*
+ * One software token-bucket admission slot per egress queue.  Bytes are
+ * the unit throughout: `tokens` and `capacity_bytes` are byte credits,
+ * `rate_bytes_per_sec` is the SONiC scheduler PIR translated to bytes/s
+ * (0 => the queue can never admit, i.e. a fully blocking scheduler).
+ *
+ * NOTE (first increment): the bucket is a single shared slot per
+ * (sw_if_index, queue) with no per-worker partitioning, so it assumes
+ * the vlab single-worker dispatch.  Multi-worker correctness (per-thread
+ * buckets or atomics) is deferred; see the HLD limitations.
+ */
+typedef struct
+{
+  u8 eligible;             /* queue buffer profile uses DROP_AND_TRIM */
+  u8 configured;           /* a rate/capacity has been programmed */
+  u64 rate_bytes_per_sec;  /* SONiC scheduler PIR, bytes/s (0 => block) */
+  u64 capacity_bytes;      /* token-bucket depth (buffer profile size) */
+  f64 tokens;              /* current byte credits */
+  f64 last_refill;         /* vlib_time_now() of the last refill */
+} sonic_ext_trim_queue_t;
+
+typedef struct
+{
+  /* Tracks whether the interface-output "sonic-ext-trim-admission" feature
+   * arc is currently enabled on this port. vnet_feature_enable_disable() is
+   * not idempotent (each enable pushes another instance of the arc onto the
+   * feature config), so the arc is toggled only on an actual transition of
+   * this state. Zero-initialized by vec_validate -> arc off. */
+  u8 feature_enabled;
+  sonic_ext_trim_queue_t q[SONIC_EXT_TRIM_MAX_QUEUES];
+} sonic_ext_trim_port_t;
+
 /* Per-interface Everflow mirror encap fixup config, indexed by the mirror
  * GRE tunnel sw_if_index. */
 typedef struct
@@ -130,9 +285,21 @@ typedef enum
   _ (HOST_XC, host_xc, "host-xc", 1, VPP)                                     \
   _ (DROP_MEMBER_STATS, drop_member_stats, "drop-member-stats", 1, VPP)       \
   _ (ND_PUNT, nd_punt, "nd-punt", 1, VPP)                                     \
+  _ (COPP, copp, "copp", 1, VPP)                                               \
+  _ (TRIM, trim, "trim", 1, VPP)                                               \
   _ (IP2ME, ip2me, "ip2me", 1, SAIVPP)                                        \
   _ (L2_TRAP_FIXUP, l2_trap_fixup, "l2-trap-fixup", 1, SAIVPP)                \
-  _ (L2_VLAN_FILTER, l2_vlan_filter, "l2-vlan-filter", 1, SAIVPP)
+  _ (L2_TRAP_LEARN, l2_trap_learn, "l2-trap-learn", 1, SAIVPP)                \
+  _ (L2_VLAN_FILTER, l2_vlan_filter, "l2-vlan-filter", 1, SAIVPP)             \
+  _ (PBH, pbh, "pbh", 1, SAIVPP)                                              \
+  _ (IFACE_LOOPBACK, iface_loopback, "iface-loopback", 1, SAIVPP)             \
+  _ (DROP_REASON_STATS, drop_reason_stats, "drop-reason-stats", 1, VPP)       \
+  _ (TUNNEL_ENCAP_TTL, tunnel_encap_ttl, "tunnel-encap-ttl", 1, SAIVPP)
+
+/* Router-interface loopback (hairpin) packet action values, carried in the
+ * sonic_ext_iface_loopback_set_action API and stored per sw_if_index. */
+#define SONIC_EXT_LOOPBACK_ACTION_FORWARD 0
+#define SONIC_EXT_LOOPBACK_ACTION_DROP    1
 
 typedef enum
 {
@@ -145,7 +312,7 @@ typedef enum
 
 /*
  * sonic-ext-copp-ifout: interface-output CoPP policer for
- * ARP/LACP/LLDP/UDLD/TTL_ERROR.
+ * ARP/LACP/LLDP/UDLD/TTL_ERROR/NEIGHBOR_MISS.
  */
 #define SONIC_EXT_COPP_IFOUT_MAX_ENTRIES 16
 #define SONIC_EXT_COPP_IFOUT_NAME_LEN 64
@@ -168,6 +335,9 @@ typedef struct
   u32 policer_index;
   u8 in_use;
   u8 match_ip4_ttl_expiring; /* TTL_ERROR trap */
+  u8 match_neighbor_miss; /* per-buffer semantic reason, not an ethertype */
+  u8 match_dhcp4; /* IPv4 UDP ports 67/68 */
+  u8 match_dhcp6; /* IPv6 UDP ports 546/547 */
   u8 rate_is_pps;
 } sonic_ext_copp_ifout_entry_t;
 
@@ -226,12 +396,28 @@ typedef struct
   foreach_sonic_ext_feature
 #undef _
 
+  /* Per-sw_if_index RIF loopback (hairpin) packet action,
+   * SONIC_EXT_LOOPBACK_ACTION_* (default FORWARD). Written only from the
+   * main/API thread; read by the ip4/ip6-loopback output-arc nodes on
+   * worker threads. Gated by the iface_loopback feature toggle above. */
+  u8 *loopback_action_by_sw_if_index;
+
+  /* Per-sw_if_index fixed outer TTL / hop limit of an L3 tunnel's encap
+   * (SAI pipe TTL model), 0 = none: the tunnel keeps its stock outer TTL.
+   * Written only from the main/API thread; read by the ip4/ip6
+   * tunnel-encap-ttl output-arc nodes on worker threads. Gated by the
+   * tunnel_encap_ttl feature toggle above. */
+  u8 *tunnel_encap_ttl_by_sw_if_index;
+
   /* Set once capture/host-xc have been enabled on all existing
    * interfaces, so that toggling on/off is idempotent. */
   u8 capture_enabled;
   u8 host_xc_enabled;
   u8 glean_redirect_enabled;
   u8 aggr_tap_redirect_enabled;
+
+  /* Continue the L2 feature bitmap after validating a native VLAN tag. */
+  u32 l2_vlan_filter_feat_next[32];
 
   /* Deferred egress mirror: set once the sonic-ext-egress-mirror feature
    * has been enabled on all interface-output arcs; gated by a refcount of
@@ -261,12 +447,47 @@ typedef struct
   u64 glean_redirects;
   u64 host_xc_direct;
   u64 l2_trap_fixups;
+  u64 l2_trap_learns;
   u64 ip2me_hits;
+
+  /* ---- packet trimming ---- */
+  u16 copp_msg_id_base;   /* sonic_ext_copp binary API base id */
+  u16 tunnel_msg_id_base; /* sonic_ext_tunnel binary API base id */
+  u16 trim_msg_id_base;   /* binary API base id (setup_message_id_table) */
+  u8 trim_configured;     /* any global trim policy pushed yet */
+
+  /* Global trim policy (SAI SWITCH_ATTR_PACKET_TRIM_*). */
+  u16 trim_size;          /* bytes retained; 0 => unset */
+  u8 trim_dscp_mode;      /* sonic_ext_trim_dscp_mode_t */
+  u8 trim_dscp_value;     /* symmetric DSCP (0..63) */
+  u8 trim_tc;             /* TC used for FROM_TC egress-map lookup */
+  u8 trim_queue;          /* static trim queue index (0..7) */
+
+  /*
+   * Global DSCP(0..63) -> egress queue(0..7) resolution used by the
+   * admission shim to classify a packet to its original queue.  Pushed
+   * by SAI-VPP as the composition of the SONiC DSCP_TO_TC and
+   * TC_TO_QUEUE maps, so the plugin does not replicate both maps.
+   */
+  u8 dscp_to_queue[64];
+
+  /*
+   * Per-egress-port admission state, a vec indexed by sw_if_index; each
+   * element holds one token bucket per queue.  NULL/short entries mean
+   * "no trim admission configured on that port" (feature is a no-op).
+   */
+  sonic_ext_trim_port_t *trim_ports;
+
+  /* Summary counters surfaced by `show sonic-ext trim` and SAI stats. */
+  u64 trim_sent;         /* truncated copies transmitted */
+  u64 trim_drop;         /* eligible but trim queue also congested */
+  u64 trim_admit_fail;   /* original-queue admission failures observed */
   u64 mirror_encap_fixups;
 
   /* sonic-ext-copp-ifout: ethertype -> policer binding table. */
   sonic_ext_copp_ifout_entry_t copp_ifout_entries[SONIC_EXT_COPP_IFOUT_MAX_ENTRIES];
   u32 copp_ifout_n_entries;
+  u32 copp_neighbor_miss_entry_index;
   u64 copp_ifout_conform_packets[SONIC_EXT_COPP_IFOUT_MAX_ENTRIES];
   u64 copp_ifout_exceed_packets[SONIC_EXT_COPP_IFOUT_MAX_ENTRIES];
   u64 copp_ifout_violate_packets[SONIC_EXT_COPP_IFOUT_MAX_ENTRIES];
@@ -284,6 +505,7 @@ extern vlib_node_registration_t sonic_ext_aggr_tap_redirect_node;
 extern vlib_node_registration_t sonic_ext_glean_redirect_node;
 extern vlib_node_registration_t sonic_ext_host_xc_node;
 extern vlib_node_registration_t sonic_ext_l2_trap_fixup_node;
+extern vlib_node_registration_t sonic_ext_l2_trap_learn_node;
 extern vlib_node_registration_t sonic_ext_l2_vlan_filter_node;
 extern vlib_node_registration_t sonic_ext_ip2me_ip4_node;
 extern vlib_node_registration_t sonic_ext_ip2me_ip6_node;
@@ -293,6 +515,10 @@ extern vlib_node_registration_t sonic_ext_copp_ifout_node;
 extern vlib_node_registration_t sonic_ext_copp_ip2me_node;
 extern vlib_node_registration_t sonic_ext_copp_udld_node;
 extern vlib_node_registration_t sonic_ext_copp_ttl_punt_node;
+extern vlib_node_registration_t sonic_ext_ip4_loopback_node;
+extern vlib_node_registration_t sonic_ext_ip6_loopback_node;
+extern vlib_node_registration_t sonic_ext_ip4_tunnel_encap_ttl_node;
+extern vlib_node_registration_t sonic_ext_ip6_tunnel_encap_ttl_node;
 
 /* Enable / disable sonic-ext-capture on a given interface.  No-op if
  * the capture sidecar is not yet initialized. */
@@ -330,6 +556,7 @@ void sonic_ext_ip2me_enable_disable (u32 sw_if_index, int enable);
 
 /* Toggle accessors used by CLI and node fast paths. */
 void sonic_ext_set_punt_via_member (u8 is_enable);
+void sonic_ext_neighbor_miss_enable_redirect (void);
 void sonic_ext_set_host_xc (u8 is_enable);
 void sonic_ext_set_nd_punt (u8 is_enable);
 
@@ -355,6 +582,167 @@ int sonic_ext_phy_is_bvi (u32 phy_sw_if_index);
  * port-channel aggregates and to funnel tap-less bonded sub-interface
  * punts to the bond master host tap. */
 int sonic_ext_phy_is_bond (u32 phy_sw_if_index);
+/* ---- packet trimming (trim_admission_node.c / trim_api.c) ---- */
+
+extern vlib_node_registration_t sonic_ext_trim_admission_node;
+
+/* Enable/disable the sonic-ext-trim-admission feature on an egress
+ * interface-output arc.  Driven from the binary API when a port gains or
+ * loses trim-eligible queues. */
+int sonic_ext_trim_enable_disable (u32 sw_if_index, int enable);
+
+/* Get (optionally allocate) the per-port admission state for sw_if_index.
+ * Returns NULL when create==0 and the port has no state. */
+sonic_ext_trim_port_t *sonic_ext_trim_port_get (u32 sw_if_index, int create);
+
+/* Program one egress (port, queue) admission slot and (re)evaluate whether
+ * the sonic-ext-trim-admission feature should be enabled on the port.
+ * Shared by the binary API handler and the debug CLI. Returns 0 on success or
+ * a nonzero vnet API error if the feature-arc enable/disable transition failed,
+ * so the caller can surface the failure (the queue state itself is always
+ * programmed). */
+int sonic_ext_trim_queue_program (u32 sw_if_index, u32 queue, int eligible,
+                                  u64 rate_bytes_per_sec, u64 capacity_bytes);
+
+/* Software token-bucket admission decision for one packet of `len` bytes
+ * on queue `q`.  Refills from rate_bytes_per_sec, then either debits and
+ * returns 1 (admitted) or leaves the bucket and returns 0 (rejected).  A
+ * queue with rate_bytes_per_sec==0 always rejects once drained. */
+int sonic_ext_trim_bucket_admit (vlib_main_t *vm, sonic_ext_trim_queue_t *q,
+                                 u32 len);
+
+/* Register the trim binary API message table.  Called from
+ * sonic_ext_init(); sets sonic_ext_main.trim_msg_id_base. */
+clib_error_t *sonic_ext_trim_api_hookup (vlib_main_t *vm);
+
+/* Register the compatibility-isolated CoPP binary API message table. Called
+ * from sonic_ext_init(); sets sonic_ext_main.copp_msg_id_base. */
+clib_error_t *sonic_ext_copp_api_hookup (vlib_main_t *vm);
+
+/* Register the compatibility-isolated tunnel binary API message table. Called
+ * from sonic_ext_init(); sets sonic_ext_main.tunnel_msg_id_base. */
+clib_error_t *sonic_ext_tunnel_api_hookup (vlib_main_t *vm);
+
+/* Policy is programmed on physical ports, while VLAN egress keeps the
+ * sub-interface in VLIB_TX. Do not change VLIB_TX: the rewrite/TX path needs it. */
+static_always_inline u32
+sonic_ext_trim_egress_port_sw_if_index (vlib_buffer_t *b)
+{
+  vnet_main_t *vnm = vnet_get_main ();
+  u32 sw_if_index = vnet_buffer (b)->sw_if_index[VLIB_TX];
+
+  if (PREDICT_FALSE (
+	sw_if_index == ~0 ||
+	vnet_get_sw_interface_or_null (vnm, sw_if_index) == 0))
+    return ~0;
+
+  return vnet_get_sup_hw_interface (vnm, sw_if_index)->sw_if_index;
+}
+
+/*
+ * ------------------------------------------------------------------
+ * L3 classification / DSCP rewrite inlines used by the admission node
+ * and its trim helper.
+ *
+ * The node runs on the interface-output arc, where the buffer's
+ * current data is positioned at the start of the (rewritten) L2
+ * ethernet header for normal transit/routed traffic.  We parse the
+ * ethertype, skip up to two VLAN tags, and locate the IPv4/IPv6
+ * header.  Non-IP frames have no resolvable queue (sentinel
+ * SONIC_EXT_TRIM_QUEUE_NONE) and are never trimmed.
+ * ------------------------------------------------------------------
+ */
+
+/* Locate the L3 header after L2 + up to two VLAN tags.  Returns a
+ * pointer to the L3 header and writes the (host-order) L3 ethertype to
+ * *etype.  Caller must ensure the bytes are present (trim_size and real
+ * MTU packets always carry the IP header). */
+static_always_inline u8 *
+sonic_ext_trim_find_l3 (vlib_buffer_t *b, u16 *etype)
+{
+  u8 *eth = vlib_buffer_get_current (b);
+  u16 et = clib_net_to_host_u16 (*(u16 *) (eth + 12));
+  u32 o = 14;
+  int n = 0;
+
+  while ((et == ETHERNET_TYPE_VLAN || et == ETHERNET_TYPE_DOT1AD ||
+	  et == ETHERNET_TYPE_VLAN_9100) &&
+	 n < 2)
+    {
+      et = clib_net_to_host_u16 (*(u16 *) (eth + o + 2));
+      o += 4;
+      n++;
+    }
+
+  *etype = et;
+  return eth + o;
+}
+
+/* Extract the 6-bit DSCP from an IPv4/IPv6 packet.  Returns 1 and sets
+ * *dscp for IP packets, 0 for non-IP (caller treats as queue 0). */
+static_always_inline int
+sonic_ext_trim_packet_dscp (vlib_buffer_t *b, u8 *dscp)
+{
+  u16 et;
+  u8 *l3 = sonic_ext_trim_find_l3 (b, &et);
+
+  if (et == ETHERNET_TYPE_IP4)
+    {
+      ip4_header_t *ip = (ip4_header_t *) l3;
+      *dscp = ip->tos >> 2;
+      return 1;
+    }
+  if (et == ETHERNET_TYPE_IP6)
+    {
+      ip6_header_t *ip = (ip6_header_t *) l3;
+      u32 v =
+	clib_net_to_host_u32 (ip->ip_version_traffic_class_and_flow_label);
+      *dscp = (v >> 22) & 0x3f;
+      return 1;
+    }
+  return 0;
+}
+
+/* Resolve the egress queue (0..7) for a packet from its DSCP via the
+ * SAI-pushed dscp_to_queue table.  Non-IP packets (ARP/LACP/LLDP/...)
+ * have no DSCP and therefore no resolvable egress queue: they return the
+ * SONIC_EXT_TRIM_QUEUE_NONE sentinel so the admission node bypasses them
+ * unconditionally and never trims a control frame (which also keeps LAG
+ * control-plane traffic intact when queue 0 is trim-eligible). */
+static_always_inline u8
+sonic_ext_trim_packet_queue (sonic_ext_main_t *sem, vlib_buffer_t *b)
+{
+  u8 dscp;
+
+  if (!sonic_ext_trim_packet_dscp (b, &dscp))
+    return SONIC_EXT_TRIM_QUEUE_NONE;
+  return sem->dscp_to_queue[dscp & 0x3f];
+}
+
+/* Rewrite the DSCP of an (already truncated) trimmed copy to new_dscp,
+ * fixing the IPv4 header checksum.  IPv6 carries no header checksum. */
+static_always_inline void
+sonic_ext_trim_rewrite_dscp (vlib_buffer_t *b, u8 new_dscp)
+{
+  u16 et;
+  u8 *l3 = sonic_ext_trim_find_l3 (b, &et);
+
+  if (et == ETHERNET_TYPE_IP4)
+    {
+      ip4_header_t *ip = (ip4_header_t *) l3;
+      ip->tos = (u8) ((new_dscp << 2) | (ip->tos & 0x3));
+      ip->checksum = 0;
+      ip->checksum = ip4_header_checksum (ip);
+    }
+  else if (et == ETHERNET_TYPE_IP6)
+    {
+      ip6_header_t *ip = (ip6_header_t *) l3;
+      u32 v =
+	clib_net_to_host_u32 (ip->ip_version_traffic_class_and_flow_label);
+      v = (v & ~(0x3full << 22)) | (((u32) (new_dscp & 0x3f)) << 22);
+      ip->ip_version_traffic_class_and_flow_label = clib_host_to_net_u32 (v);
+    }
+}
 
 /* Deferred egress mirror refcount toggle.  enable=1 installs a
  * MIRROR_EGRESS action (enabling sonic-ext-egress-mirror on every
@@ -384,6 +772,7 @@ int sonic_ext_acl_deferred_mirror_stamp (vlib_buffer_t *b, u32 rx_sw_if_index,
  * TAP sw_if_index.
  */
 void sonic_ext_copp_ifout_enable_disable (u32 sw_if_index, int enable);
+void sonic_ext_copp_udld_enable (vlib_main_t *vm);
 
 /*
  * look up an entry by wire ethertype/length value.
@@ -396,11 +785,31 @@ int sonic_ext_copp_ifout_find_entry (sonic_ext_main_t *sem, u16 ethertype);
  */
 int sonic_ext_copp_ifout_bind (u16 ethertype, const char *policer_name,
 			       int is_bind, int match_ip4_ttl_expiring);
+
+/* Bind the semantic NEIGHBOR_MISS reason to a copp-ifout policer row. */
+int sonic_ext_copp_neighbor_miss_bind (const char *policer_name, int is_bind);
+int sonic_ext_copp_neighbor_miss_is_bound (sonic_ext_main_t *sem);
+/* Bind one family of the semantic DHCP trap to copp-ifout. */
+int sonic_ext_copp_dhcp_bind (const char *policer_name, int is_ipv6,
+			      int is_bind);
+int sonic_ext_copp_dhcp_is_bound (sonic_ext_main_t *sem, int is_ipv6);
 int sonic_ext_copp_ip2me_addr_add_del (u32 addr, int is_add);
 int sonic_ext_copp_ip2me_bind (const char *policer_name, int is_bind);
 int sonic_ext_copp_ip2me_bind_condition (
   const char *policer_name, const sonic_ext_copp_ip2me_condition_t *condition,
   int is_bind);
 int sonic_ext_copp_ttl_punt_bind (int is_bind);
+
+/* Set the per-interface RIF loopback (hairpin) packet action and enable or
+ * disable the sonic-ext-ip4/ip6-loopback output-arc nodes accordingly.
+ * Returns 0 on success, a VNET_API_ERROR_* on failure. Honours the
+ * iface_loopback feature toggle. */
+int sonic_ext_iface_loopback_set_action (u32 sw_if_index, u8 action);
+
+/* Set the fixed outer TTL / hop limit of an L3 tunnel's encap (SAI pipe TTL
+ * model) and enable the sonic-ext-ip4/ip6-tunnel-encap-ttl output-arc nodes
+ * on the tunnel while it is non-zero; 0 removes it. Returns 0 on success, a
+ * VNET_API_ERROR_* on failure. Honours the tunnel_encap_ttl feature toggle. */
+int sonic_ext_tunnel_encap_ttl_set (u32 sw_if_index, u8 ttl);
 
 #endif /* __included_sonic_ext_h__ */

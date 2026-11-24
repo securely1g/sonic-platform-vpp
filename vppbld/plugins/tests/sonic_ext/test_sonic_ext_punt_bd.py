@@ -46,8 +46,16 @@ LLDP is covered on both punt paths.  On the access phy it is a bridged frame
 and is punted by the classify table.  On the trunk phy it never enters the
 bridge -- the phy is not a BD member -- so it takes the L3 path through
 ethernet-input's ethertype demux, which requires "lcp ethertype enable".
+
+TestSonicExtL2TrapLearn reruns all of this with the DHCPv4 sessions pointed
+at sonic-ext-l2-trap-learn, as saivpp points every trap session except LLDP's
+when the l2-trap-learn feature is on, and checks that the trapped frame's
+source MAC is learned on its ingress bridge port without the frame being
+flooded.
 """
 
+import re
+import time
 import unittest
 
 from scapy.contrib.lldp import (
@@ -58,14 +66,24 @@ from scapy.contrib.lldp import (
 )
 from scapy.layers.dhcp import BOOTP, DHCP
 from scapy.layers.inet import IP, UDP
+from scapy.layers.inet6 import IPv6
 from scapy.layers.l2 import ARP, Dot1Q, Ether
+from scapy.packet import Raw
 
 from asfframework import VppTestRunner, get_testcase_dirname
 from config import config
 from framework import VppTestCase
 from host_interface import HostInterface
 from vpp_bvi_interface import VppBviInterface
-from vpp_l2 import L2_PORT_TYPE, VppBridgeDomain, VppBridgeDomainPort
+from vpp_l2 import (
+    L2_PORT_TYPE,
+    VppBridgeDomain,
+    VppBridgeDomainPort,
+    find_l2_fib_entry,
+)
+from vpp_papi import VppEnum
+from vpp_ip_route import VppIpRoute, VppRoutePath
+from vpp_policer import PolicerAction, VppPolicer
 from vpp_qemu_utils import create_namespace, delete_all_namespaces, set_interface_up
 from vpp_sub_interface import L2_VTR_OP, VppDot1QSubint
 
@@ -84,6 +102,14 @@ REDIRECTED = (
 NOT_REDIRECTED = (
     "/err/sonic-ext-aggr-tap-redirect/punt-via-member disabled -- left on aggregate tap"
 )
+TRAP_LEARNED = "/err/sonic-ext-l2-trap-learn/L2 trapped packet sent to l2-learn"
+TRAP_NOT_LEARNED = (
+    "/err/sonic-ext-l2-trap-learn/L2 trapped packet not learned: learning off"
+)
+
+QOS = VppEnum.vl_api_sse2_qos_action_type_t
+RATE = VppEnum.vl_api_sse2_qos_rate_type_t
+DROP = PolicerAction(QOS.SSE2_QOS_ACTION_API_DROP, 0)
 
 
 @unittest.skipIf("linux-cp" in config.excluded_plugins, "Exclude linux-cp plugin tests")
@@ -91,8 +117,10 @@ NOT_REDIRECTED = (
     "sonic_ext" in config.excluded_plugins, "Exclude sonic-ext plugin tests"
 )
 @unittest.skipIf(config.skip_netns_tests, "netns not available or disabled from cli")
-class TestSonicExtL2Punt(VppTestCase):
-    """SONiC-ext L2 punt: capture and aggregate-tap redirect"""
+class SonicExtL2PuntBase(VppTestCase):
+    """SONiC-ext L2 punt test base"""
+
+    vpp_worker_count = 0
 
     # Both plugins are .default_disabled, so ask for them explicitly.
     extra_vpp_plugin_config = [
@@ -106,10 +134,21 @@ class TestSonicExtL2Punt(VppTestCase):
         "{",
         "enable",
         "}",
+        "plugin",
+        "policer_plugin.so",
+        "{",
+        "enable",
+        "}",
     ]
 
     BD_ID = 1
     VLAN_ID = 100
+    # Turning punt-via-member on at runtime wires it, so a class testing it
+    # off in startup.conf must not.
+    PUNT_VIA_MEMBER = True
+
+    # Point the DHCPv4 sessions at sonic-ext-l2-trap-learn.
+    TRAP_LEARN = False
 
     #
     # netns plumbing -- the namespace has to exist before VPP starts
@@ -140,7 +179,7 @@ class TestSonicExtL2Punt(VppTestCase):
         super().tearDownClass()
 
     def setUp(self):
-        super(TestSonicExtL2Punt, self).setUp()
+        super(SonicExtL2PuntBase, self).setUp()
 
         self.create_pg_interfaces(range(2))
         for i in self.pg_interfaces:
@@ -199,7 +238,8 @@ class TestSonicExtL2Punt(VppTestCase):
             self.vapi.cli("lcp ethertype enable %d" % ethertype)
         self.logger.info("lcp ethertype:\n%s", self.vapi.cli("show lcp ethertype"))
 
-        self.vapi.cli("sonic-ext punt-via-member on")
+        if self.PUNT_VIA_MEMBER:
+            self.vapi.cli("sonic-ext punt-via-member on")
 
         self._install_punt_classifiers()
         self.logger.info("sonic-ext:\n%s", self.vapi.cli("show sonic-ext"))
@@ -222,7 +262,7 @@ class TestSonicExtL2Punt(VppTestCase):
 
         for i in self.pg_interfaces:
             i.admin_down()
-        super(TestSonicExtL2Punt, self).tearDown()
+        super(SonicExtL2PuntBase, self).tearDown()
 
     def _lcp_create(self, itf, host_if_name):
         """Create an LCP pair and return a HostInterface for its Linux tap."""
@@ -284,6 +324,17 @@ class TestSonicExtL2Punt(VppTestCase):
         trap_fixup_next = self._node_next(
             "l2-input-classify", "sonic-ext-l2-trap-fixup"
         )
+        # Untagged DHCP punts straight to linux-cp-punt: VLIB_RX is already the
+        # parent phy, so no trap fixup is required.  Tagged DHCP needs the trap
+        # fixup, because a bridged sub-if has no LCP pair.  With l2-trap-learn
+        # on, both go to sonic-ext-l2-trap-learn, which hands its copy to the
+        # trap fixup.
+        if self.TRAP_LEARN:
+            untag_dhcp_next = tag_dhcp_next = self._node_next(
+                "l2-input-classify", "sonic-ext-l2-trap-learn"
+            )
+        else:
+            untag_dhcp_next, tag_dhcp_next = punt_next, trap_fixup_next
 
         bcast = {i: 0xFF for i in range(6)}
 
@@ -302,9 +353,7 @@ class TestSonicExtL2Punt(VppTestCase):
                 37: DHCP_SERVER_PORT & 0xFF,
             },
         )
-        # Untagged DHCP punts straight to linux-cp-punt: VLIB_RX is already the
-        # parent phy, so no trap fixup is required.
-        self._add_session(self.untag_ip4_table, punt_next, match)
+        self._add_session(self.untag_ip4_table, untag_dhcp_next, match)
 
         # Untagged OTHER slot: LLDP by ethertype.
         mask = self._vec(16, {12: 0xFF, 13: 0xFF})
@@ -313,8 +362,7 @@ class TestSonicExtL2Punt(VppTestCase):
         self._add_session(self.untag_other_table, punt_next, match)
 
         # Tagged OTHER slot: DHCPv4 over .1Q.  The VTR pop has not run at
-        # l2-input-classify, so every post-L2 offset shifts by 4.  Hit-next is
-        # the trap fixup, because a bridged sub-if has no LCP pair.
+        # l2-input-classify, so every post-L2 offset shifts by 4.
         mask = self._vec(48, bcast, {16: 0xFF, 17: 0xFF, 27: 0xFF, 40: 0xFF, 41: 0xFF})
         self.tag_dhcp_table = self._add_table(mask, 3)
         match = self._vec(
@@ -328,7 +376,7 @@ class TestSonicExtL2Punt(VppTestCase):
                 41: DHCP_SERVER_PORT & 0xFF,
             },
         )
-        self._add_session(self.tag_dhcp_table, trap_fixup_next, match)
+        self._add_session(self.tag_dhcp_table, tag_dhcp_next, match)
 
         self.vapi.classify_set_interface_l2_tables(
             sw_if_index=self.access_phy.sw_if_index,
@@ -385,12 +433,13 @@ class TestSonicExtL2Punt(VppTestCase):
             return eth / Dot1Q(vlan=self.VLAN_ID) / payload
         return eth / payload
 
-    def _dhcp_request(self, phy, tagged=False):
-        eth = Ether(dst=BCAST_MAC, src=phy.remote_mac)
+    def _dhcp_request(self, phy, tagged=False, src_mac=None):
+        src_mac = src_mac or phy.remote_mac
+        eth = Ether(dst=BCAST_MAC, src=src_mac)
         payload = (
             IP(src="0.0.0.0", dst="255.255.255.255")
             / UDP(sport=DHCP_CLIENT_PORT, dport=DHCP_SERVER_PORT)
-            / BOOTP(op=1, chaddr=bytes.fromhex(phy.remote_mac.replace(":", "")))
+            / BOOTP(op=1, chaddr=bytes.fromhex(src_mac.replace(":", "")))
             / DHCP(options=[("message-type", "request"), "end"])
         )
         if tagged:
@@ -424,6 +473,23 @@ class TestSonicExtL2Punt(VppTestCase):
             return p[Dot1Q].type != LLDP_ETHERTYPE
         return p[Ether].type != LLDP_ETHERTYPE
 
+    @staticmethod
+    def _not_from(src_mac):
+        """Drop everything not sourced by *src_mac*.
+
+        The Linux side of the LCP taps emits its own traffic -- IPv6 DAD
+        neighbour solicitations for the link-local address, MLD reports, ...
+        -- which VPP receives on the tap and floods through the bridge
+        domain out of the pg members.  is_ipv6_misc(), the pg default
+        filter, does not cover neighbour discovery, so filter on the source
+        MAC of the frame under test instead.
+        """
+
+        def filter_out_fn(p):
+            return p[Ether].src != src_mac
+
+        return filter_out_fn
+
     #
     # helpers
     #
@@ -448,7 +514,9 @@ class TestSonicExtL2Punt(VppTestCase):
                 expected_count=1, timeout=5, filter_out_fn=filter_out_fn
             )
             for member, expect_tagged in flood_to:
-                flooded = member.get_capture(1)
+                flooded = member.get_capture(
+                    1, filter_out_fn=self._not_from(pkt[Ether].src)
+                )
                 self._assert_flooded(pkt, flooded[0], member, expect_tagged)
         finally:
             # Nothing else dumps the trace for us: the send_and_expect helpers
@@ -487,6 +555,10 @@ class TestSonicExtL2Punt(VppTestCase):
             "punted frame lost its VLAN tag on the way to the member tap",
         )
         self.assertEqual(rx[Dot1Q].vlan, self.VLAN_ID)
+
+
+class TestSonicExtL2Punt(SonicExtL2PuntBase):
+    """SONiC-ext L2 punt: capture and aggregate-tap redirect"""
 
     #
     # scenario 1 -- untagged, received on the physical bridge member
@@ -555,6 +627,41 @@ class TestSonicExtL2Punt(VppTestCase):
         self.assertEqual(rx[ARP].pdst, "10.0.0.1")
         self.assertEqual(self._err(REDIRECTED), before + 1)
 
+    def test_classifier_punted_dhcp_uses_semantic_policer(self):
+        """Sairedis' classifier owns TRAP; copp-ifout owns its policer."""
+        pol = VppPolicer(
+            self,
+            "copp-classifier-dhcp4",
+            1000,
+            0,
+            100000,
+            0,
+            rate_type=RATE.SSE2_QOS_RATE_API_KBPS,
+        ).add_vpp_config()
+        self.vapi.sonic_ext_copp_dhcp_bind(
+            policer_name=pol.name,
+            is_ipv6=False,
+            is_bind=True,
+        )
+        try:
+            before = self.vapi.sonic_ext_copp_dhcp_get_counters(is_ipv6=False)
+            rx = self._punt(
+                self.access_phy,
+                self._dhcp_request(self.access_phy),
+                self.access_tap,
+                self._not_dhcp,
+            )
+            after = self.vapi.sonic_ext_copp_dhcp_get_counters(is_ipv6=False)
+            self.assertEqual(rx[UDP].dport, DHCP_SERVER_PORT)
+            self.assertEqual(after.conform_packets, before.conform_packets + 1)
+        finally:
+            self.vapi.sonic_ext_copp_dhcp_bind(
+                policer_name=pol.name,
+                is_ipv6=False,
+                is_bind=False,
+            )
+            pol.remove_vpp_config()
+
     def test_tagged_dhcp_to_parent_member_tap(self):
         """Tagged DHCP is trap-fixed up and punted to the parent phy's tap"""
         rx = self._punt(
@@ -604,6 +711,351 @@ class TestSonicExtL2Punt(VppTestCase):
             self.assertEqual(self._err(NOT_REDIRECTED), before + 1)
         finally:
             self.vapi.cli("sonic-ext punt-via-member on")
+
+
+    def _assert_neighbor_miss_semantic_policing(self, prefix, l3):
+        pkt = (
+            Ether(src=self.access_phy.remote_mac, dst=self.bvi.local_mac)
+            / l3
+            / Raw(b"neighbor-miss")
+        )
+        pol = VppPolicer(
+            self,
+            "copp-neighbor-miss-%s" % ("ip6" if isinstance(l3, IPv6) else "ip4"),
+            1000,
+            0,
+            100000,
+            0,
+            rate_type=RATE.SSE2_QOS_RATE_API_KBPS,
+            conform_action=DROP,
+            exceed_action=DROP,
+            violate_action=DROP,
+        )
+
+        self.vapi.sw_interface_add_del_address(
+            sw_if_index=self.bvi.sw_if_index, prefix=prefix
+        )
+        try:
+            pol.add_vpp_config()
+            # Unbound control: the existing neighbor-resolution redirect
+            # remains functional and byte-preserving.
+            rx = self._punt(
+                self.access_phy,
+                pkt,
+                self.access_tap,
+                self._not_from(pkt[Ether].src),
+            )
+            self.assertEqual(bytes(rx), bytes(pkt))
+
+            # The glean redirect has a per-adjacency ~1 ms throttle. Wait
+            # beyond it so this checks CoPP rather than the earlier throttle.
+            time.sleep(0.02)
+            self.vapi.sonic_ext_copp_neighbor_miss_bind(
+                policer_name=pol.name, is_bind=True
+            )
+
+            before = pol.get_stats()["conform_packets"]
+            self.access_tap.enable_capture()
+            self.access_phy.add_stream([pkt])
+            self.pg_start(trace=True)
+            self.access_tap.get_capture(
+                expected_count=0,
+                timeout=1,
+                filter_out_fn=self._not_from(pkt[Ether].src),
+            )
+            self.assertEqual(pol.get_stats()["conform_packets"], before + 1)
+        finally:
+            self.vapi.sonic_ext_copp_neighbor_miss_bind(
+                policer_name=pol.name, is_bind=False
+            )
+            if pol.query_vpp_config():
+                pol.remove_vpp_config()
+            self.vapi.sw_interface_add_del_address(
+                sw_if_index=self.bvi.sw_if_index, prefix=prefix, is_add=0
+            )
+
+    def test_ip4_neighbor_miss_semantic_row_polices_only_bound_bvi_glean(self):
+        """An IPv4 BVI glean is policed only while NEIGHBOR_MISS is bound."""
+        self._assert_neighbor_miss_semantic_policing(
+            "10.10.10.1/24", IP(src="10.10.10.2", dst="10.10.10.99")
+        )
+
+    def test_ip6_neighbor_miss_semantic_row_polices_only_bound_bvi_glean(self):
+        """An IPv6 BVI glean is policed only while NEIGHBOR_MISS is bound."""
+        self._assert_neighbor_miss_semantic_policing(
+            "2001:db8:10::1/64",
+            IPv6(src="2001:db8:10::2", dst="2001:db8:10::99"),
+        )
+
+    def test_unpoliced_neighbor_miss_bypasses_legacy_throttle(self):
+        """An active row with no policer admits a burst to the CPU."""
+        prefix = "10.20.20.1/24"
+        pkt = (
+            Ether(src=self.access_phy.remote_mac, dst=self.bvi.local_mac)
+            / IP(src="10.20.20.2", dst="10.20.20.99")
+            / Raw(b"unpoliced-neighbor-miss")
+        )
+        self.vapi.sw_interface_add_del_address(
+            sw_if_index=self.bvi.sw_if_index, prefix=prefix
+        )
+        try:
+            self.vapi.sonic_ext_copp_neighbor_miss_bind(policer_name="", is_bind=True)
+            self.access_tap.enable_capture()
+            self.access_phy.add_stream([pkt, pkt, pkt])
+            self.pg_start(trace=True)
+            rxs = self.access_tap.get_capture(
+                expected_count=3,
+                timeout=5,
+                filter_out_fn=self._not_from(pkt[Ether].src),
+            )
+            self.assertEqual([bytes(rx) for rx in rxs], [bytes(pkt)] * 3)
+        finally:
+            self.vapi.sonic_ext_copp_neighbor_miss_bind(policer_name="", is_bind=False)
+            self.vapi.sw_interface_add_del_address(
+                sw_if_index=self.bvi.sw_if_index, prefix=prefix, is_add=0
+            )
+
+    def test_neighbor_miss_survives_runtime_punt_via_member_off(self):
+        """The semantic trap owns glean redirect independently at runtime."""
+        prefix = "10.30.30.1/24"
+        pkt = (
+            Ether(src=self.access_phy.remote_mac, dst=self.bvi.local_mac)
+            / IP(src="10.30.30.2", dst="10.30.30.99")
+            / Raw(b"neighbor-miss-punt-via-member-off")
+        )
+        self.vapi.sw_interface_add_del_address(
+            sw_if_index=self.bvi.sw_if_index, prefix=prefix
+        )
+        try:
+            self.vapi.sonic_ext_copp_neighbor_miss_bind(policer_name="", is_bind=True)
+            self.vapi.cli("sonic-ext punt-via-member off")
+            rx = self._punt(
+                self.access_phy,
+                pkt,
+                self.access_tap,
+                self._not_from(pkt[Ether].src),
+            )
+            self.assertEqual(bytes(rx), bytes(pkt))
+        finally:
+            self.vapi.sonic_ext_copp_neighbor_miss_bind(policer_name="", is_bind=False)
+            self.vapi.cli("sonic-ext punt-via-member on")
+            self.vapi.sw_interface_add_del_address(
+                sw_if_index=self.bvi.sw_if_index, prefix=prefix, is_add=0
+            )
+
+    def test_ip6_incomplete_neighbor_miss_preserves_and_policies_packet(self):
+        """An IPv6 recursive next-hop miss punts the untouched packet."""
+        prefix = "2001:db8:20::1/64"
+        next_hop = "2001:db8:20::2"
+        destination = "2001:db8:30::99"
+        pkt = (
+            Ether(src=self.access_phy.remote_mac, dst=self.bvi.local_mac)
+            / IPv6(src="2001:db8:40::2", dst=destination)
+            / Raw(b"ip6-incomplete-neighbor-miss")
+        )
+        pol = VppPolicer(
+            self,
+            "copp-neighbor-miss-ip6-incomplete",
+            1000,
+            0,
+            100000,
+            0,
+            rate_type=RATE.SSE2_QOS_RATE_API_KBPS,
+            conform_action=DROP,
+            exceed_action=DROP,
+            violate_action=DROP,
+        )
+        route = VppIpRoute(
+            self,
+            destination,
+            128,
+            [VppRoutePath(next_hop, self.bvi.sw_if_index)],
+        )
+
+        self.vapi.sw_interface_add_del_address(
+            sw_if_index=self.bvi.sw_if_index, prefix=prefix
+        )
+        try:
+            route.add_vpp_config()
+            pol.add_vpp_config()
+            self.vapi.sonic_ext_copp_neighbor_miss_bind(
+                policer_name=pol.name, is_bind=True
+            )
+
+            before = pol.get_stats()["conform_packets"]
+            self.access_tap.enable_capture()
+            self.access_phy.add_stream([pkt])
+            self.pg_start(trace=True)
+            self.access_tap.get_capture(
+                expected_count=0,
+                timeout=1,
+                filter_out_fn=self._not_from(pkt[Ether].src),
+            )
+            self.assertEqual(pol.get_stats()["conform_packets"], before + 1)
+
+            # Prove the same incomplete-adjacency path preserves the packet
+            # when admitted, including the original routed destination.
+            self.vapi.sonic_ext_copp_neighbor_miss_bind(
+                policer_name=pol.name, is_bind=False
+            )
+            rx = self._punt(
+                self.access_phy,
+                pkt,
+                self.access_tap,
+                self._not_from(pkt[Ether].src),
+            )
+            self.assertEqual(bytes(rx), bytes(pkt))
+        finally:
+            self.vapi.sonic_ext_copp_neighbor_miss_bind(
+                policer_name=pol.name, is_bind=False
+            )
+            if pol.query_vpp_config():
+                pol.remove_vpp_config()
+            if route.query_vpp_config():
+                route.remove_vpp_config()
+            self.vapi.sw_interface_add_del_address(
+                sw_if_index=self.bvi.sw_if_index, prefix=prefix, is_add=0
+            )
+
+
+class TestSonicExtL2PuntStartupOff(SonicExtL2PuntBase):
+    """SONiC-ext L2 punt with punt-via-member off in startup.conf"""
+
+    extra_vpp_config = ["sonic-ext", "{", "punt-via-member", "off", "}"]
+    PUNT_VIA_MEMBER = False
+
+    def test_punt_via_member_startup_off(self):
+        """punt-via-member off at startup never wires the aggregate-tap redirect"""
+        self.assertFalse(
+            self.vapi.sonic_ext_feature_get(feature="punt-via-member").enabled
+        )
+        for itf in self.vapi.sw_interface_dump():
+            output = self.vapi.cli("show interface features %s" % itf.interface_name)
+            features = (line.strip() for line in output.splitlines())
+            self.assertFalse(
+                "sonic-ext-aggr-tap-redirect" in features,
+                "sonic-ext-aggr-tap-redirect on %s" % itf.interface_name,
+            )
+
+        redirected = self._err(REDIRECTED)
+        not_redirected = self._err(NOT_REDIRECTED)
+
+        rx = self._punt(
+            self.access_phy,
+            self._arp_request(self.access_phy),
+            self.aggr_tap,
+            self._not_arp,
+            flood_to=[(self.trunk_phy, True)],
+        )
+
+        self.assertEqual(rx[ARP].pdst, "10.0.0.1")
+        # Unlike a runtime off, the redirect node is not on the arc to count.
+        self.assertEqual(self._err(REDIRECTED), redirected)
+        self.assertEqual(self._err(NOT_REDIRECTED), not_redirected)
+
+
+class TestSonicExtL2TrapLearn(TestSonicExtL2Punt):
+    """SONiC-ext L2 punt: trap sessions on sonic-ext-l2-trap-learn"""
+
+    TRAP_LEARN = True
+
+    # Source MACs no other test sends from, so that only the frame under test
+    # can have put them in the L2 FIB.
+    UNTAGGED_SRC = "02:00:00:00:01:01"
+    TAGGED_SRC = "02:00:00:00:01:02"
+    NO_LEARN_SRC = "02:00:00:00:01:03"
+
+    def _trap(self, phy, tagged, tap, src_mac, not_flooded_to):
+        """Send a DHCPv4 request from *src_mac*, check that it is trapped to
+        *tap* and that no copy of it is flooded to *not_flooded_to*."""
+        rx = self._punt(
+            phy,
+            self._dhcp_request(phy, tagged=tagged, src_mac=src_mac),
+            tap,
+            self._not_dhcp,
+        )
+        self.assertEqual(rx[Ether].src, src_mac)
+        not_flooded_to.assert_nothing_captured(filter_out_fn=self._not_from(src_mac))
+        return rx
+
+    def _trap_learns(self):
+        """The "l2 trap learns" count of "show sonic-ext"."""
+        m = re.search(r"l2 trap learns\s*:\s*(\d+)", self.vapi.cli("show sonic-ext"))
+        self.assertIsNotNone(m, "no l2 trap learns count in show sonic-ext")
+        return int(m.group(1))
+
+    def test_untagged_trap_learned(self):
+        """Untagged trapped frame: punted once, source MAC learned on the phy"""
+        before = self._err(TRAP_LEARNED)
+        learns = self._trap_learns()
+
+        rx = self._trap(
+            self.access_phy,
+            False,
+            self.access_tap,
+            self.UNTAGGED_SRC,
+            not_flooded_to=self.trunk_phy,
+        )
+
+        self._assert_untagged(rx)
+        self.assertEqual(self._err(TRAP_LEARNED), before + 1)
+        self.assertEqual(self._trap_learns(), learns + 1)
+        self.assertTrue(
+            find_l2_fib_entry(
+                self, self.BD_ID, self.UNTAGGED_SRC, self.access_phy.sw_if_index
+            ),
+            "trapped frame's source MAC not learned on %s" % self.access_phy.name,
+        )
+
+    def test_tagged_trap_learned_on_sub_if(self):
+        """Tagged trapped frame: punted once with its tag, learned on the sub-if"""
+        before = self._err(TRAP_LEARNED)
+        learns = self._trap_learns()
+
+        rx = self._trap(
+            self.trunk_phy,
+            True,
+            self.trunk_tap,
+            self.TAGGED_SRC,
+            not_flooded_to=self.access_phy,
+        )
+
+        self._assert_tagged(rx)
+        self.assertEqual(self._err(TRAP_LEARNED), before + 1)
+        self.assertEqual(self._trap_learns(), learns + 1)
+        # The bridge port is the sub-if; the trap fixup's VLIB_RX rewrite to
+        # the parent phy is only for the copy sent to the host.
+        self.assertTrue(
+            find_l2_fib_entry(
+                self, self.BD_ID, self.TAGGED_SRC, self.vlan_if.sw_if_index
+            ),
+            "trapped frame's source MAC not learned on %s" % self.vlan_if.name,
+        )
+
+    def test_trap_not_learned_when_learning_off(self):
+        """Trapped frame from a port that does not learn: punted, not learned"""
+        self.vapi.cli("set interface l2 learn %s disable" % self.access_phy.name)
+        try:
+            before = self._err(TRAP_NOT_LEARNED)
+            learns = self._trap_learns()
+
+            self._trap(
+                self.access_phy,
+                False,
+                self.access_tap,
+                self.NO_LEARN_SRC,
+                not_flooded_to=self.trunk_phy,
+            )
+
+            self.assertEqual(self._err(TRAP_NOT_LEARNED), before + 1)
+            self.assertEqual(self._trap_learns(), learns)
+            self.assertFalse(
+                find_l2_fib_entry(
+                    self, self.BD_ID, self.NO_LEARN_SRC, self.access_phy.sw_if_index
+                )
+            )
+        finally:
+            self.vapi.cli("set interface l2 learn %s" % self.access_phy.name)
 
 
 if __name__ == "__main__":

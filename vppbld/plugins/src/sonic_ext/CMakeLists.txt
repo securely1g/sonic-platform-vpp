@@ -11,18 +11,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+include_directories(${CMAKE_SOURCE_DIR})
+
+# for generated API headers (sonic_ext_copp.api.*, sonic_ext_trim.api.*,
+# sonic_ext_tunnel.api.*):
+include_directories(${CMAKE_BINARY_DIR})
+
 add_vpp_plugin(sonic_ext
   SOURCES
   sonic_ext.c
   sonic_ext_api.c
+  copp_api.c
   capture_node.c
   aggr_tap_redirect_node.c
   glean_redirect_node.c
   host_xc_node.c
   l2_trap_fixup_node.c
+  l2_trap_learn_node.c
   l2_vlan_filter_node.c
   ip2me_node.c
   drop_member_stats_node.c
+  drop_reason_stats_node.c
   copp_ifout_node.c
   copp_ip2me_node.c
   copp_udld_node.c
@@ -30,9 +39,22 @@ add_vpp_plugin(sonic_ext
   cli.c
   egress_mirror_node.c
   mirror_encap_fixup_node.c
+  sonic_ext_vnet_buf.c
+  pbh.c
+  pbh_node.c
+  ip4_loopback_node.c
+  ip6_loopback_node.c
+  tunnel_encap_ttl_node.c
+  tunnel_api.c
+  trim_admission_node.c
+  trim_api.c
+  trim_cli.c
 
   API_FILES
   sonic_ext.api
+  sonic_ext_copp.api
+  sonic_ext_trim.api
+  sonic_ext_tunnel.api
 
   LINK_LIBRARIES
   lcp
